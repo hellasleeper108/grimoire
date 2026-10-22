@@ -30,14 +30,14 @@ Read in this order:
 3. `DESIGN.md` §6 — the actual TUI: layout, keys, states.
 4. `EVIDENCE-1PASSWORD.md` — the receipts, including where the tooling came up short.
 
-**Status:** design + **P0b implemented**. `grim-core` (crypto + store), `grimd` (daemon that owns
-keys and answers a closed verb set over a Unix socket) and `grim` (client with no keys, no SQL).
-No TUI, no sync yet. Phases P0–P5 in `DESIGN.md` §10.
+**Status:** design + **P0c implemented**. `grim-core` (crypto + store), `grimd` (daemon that owns
+keys and answers a closed verb set over a Unix socket), `grim` (CLI + ratatui TUI, no keys, no SQL).
+No sync yet. Phases P0–P5 in `DESIGN.md` §10.
 
 ## Build and run
 
 ```bash
-cargo test                                  # 15 tests: crypto, store, daemon lifecycle, locked gate
+cargo test                                  # 21 tests: crypto, store, daemon, TUI render
 cargo build --release
 
 export GRIM_PASSPHRASE='…'                  # or omit to be prompted
@@ -60,7 +60,42 @@ A locked daemon answers exactly four verbs (`status`, `unlock`, `quit`, and its 
 socket lives at `$XDG_RUNTIME_DIR/grimoire/grimd.sock` with mode `0600` inside a `0700` directory.
 `grim` fails loudly if the daemon is not running — it never falls back to opening the vault itself.
 
-What P0a–P0b actually do: Argon2id + account-key derivation (§4.1), canary unlock, XChaCha20-Poly1305
+## The TUI
+
+`grim tui` — three panes, keyboard only, no mouse, no colours required.
+
+| Key | Action |
+|---|---|
+| `j` / `k`, `↓` / `↑` | move selection |
+| `g` / `G` | first / last |
+| `/` | fuzzy-ish filter (title, subtitle, host); `Enter` accept, `Esc` clear |
+| `y` | copy the password via `wl-copy`/`xclip`/`xsel`/`clip.exe`, toast names the tool |
+| `t` | TOTP now, copied, with the seconds remaining |
+| `r` | reveal concealed fields for 10 s, then auto-hide |
+| `Ctrl-L` | lock the daemon (keys dropped, panes cleared) |
+| `q` | leave the view (the daemon stays as it was) |
+
+```
+ GRIMOIRE  ~/.local/share/grimoire/vault.db   3 item(s)
+┌ items ─────────────────────────────────────┐┌ detail ────────────────────────────────────────────┐
+│37c06b16  login      github                 ││github  [login]                                     │
+│93ec3ade  login      gitea                  ││id 37c06b16                                         │
+│4278c105  sshkey     deploy@vps             ││username   hella                                    │
+│                                            ││password   ••••••••…  (12 chars, r to reveal)       │
+│                                            ││totp       ••••••••…  (16 chars, r to reveal)       │
+│                                            ││url        https://github.com                       │
+└────────────────────────────────────────────┘└────────────────────────────────────────────────────┘
+ j/k move · / search · y copy · t totp · r reveal · ^L lock · q quit
+```
+
+`grim tui --snapshot` renders one frame to stdout instead of the terminal, so the layout can be
+reviewed in a PR, diffed in CI, or pasted into a bug report.
+
+Clipboard support is best-effort and named: `y` reports *which* tool accepted the value, or says
+plainly that no helper was found rather than pretending the copy worked. `DESIGN.md` §6.3 called for
+honest state rendering; that applies to failures too.
+
+What P0a–P0c actually do: Argon2id + account-key derivation (§4.1), canary unlock, XChaCha20-Poly1305
 with per-slot AAD, overview/detail split with per-item keys (§5), RFC 6238 TOTP, owner-only file
 permissions, and a daemon/socket split where the client cannot touch the store (§2, §3.2).
 

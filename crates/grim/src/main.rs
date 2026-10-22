@@ -13,6 +13,9 @@ use clap::{Parser, Subcommand};
 use grim_core::protocol::{call, Request, Response};
 use grim_core::{Detail, Error, Field, FieldKind, Overview, Result, Vault, VaultParams};
 
+mod clipboard;
+mod tui;
+
 #[derive(Parser)]
 #[command(name = "grim", version, about = "GRIMOIRE — a book of secret names")]
 struct Cli {
@@ -36,6 +39,12 @@ struct Cli {
 enum Cmd {
     /// Create a new vault and print the recovery kit (shown once)
     Init,
+    /// Interactive TUI over the daemon
+    Tui {
+        /// Render one frame as text and exit (for review and CI)
+        #[arg(long)]
+        snapshot: bool,
+    },
     /// Daemon state: locked or not, item count, vault path
     Status,
     /// Unlock the daemon (passphrase from GRIM_PASSPHRASE or prompt)
@@ -175,8 +184,16 @@ fn run(cli: &Cli) -> Result<()> {
     }
 
     let sock = socket_path(cli);
+    if let Cmd::Tui { snapshot } = cli.cmd {
+        return if snapshot {
+            print!("{}", tui::snapshot(&sock, 100, 24)?);
+            Ok(())
+        } else {
+            tui::run(&sock)
+        };
+    }
     let req = match &cli.cmd {
-        Cmd::Init => unreachable!("handled above"),
+        Cmd::Init | Cmd::Tui { .. } => unreachable!("handled above"),
         Cmd::Status => Request::Status,
         Cmd::Unlock => Request::Unlock { passphrase: passphrase(false)? },
         Cmd::Lock => Request::Lock,
