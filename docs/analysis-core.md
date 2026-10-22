@@ -107,7 +107,10 @@ Observed symbols:
 ```
 op_crypto::keychain::{decrypt_keyset_using_bytes, decrypt_vault_key, KeychainError}
 op_crypto::keys::derive_new_key_id::<16>, ::<32>
-op_crypto::secret_key_serde            (5 symbols — Secret Key has its own serializer)
+op_crypto::secret_key_serde            (Secret Key has its own serializer)
+op_crypto::secret_key::try_parse
+op_crypto::secret_key_serde::obfuscation::{deobfuscate, obfuscate_key}
+op_crypto::secret_key_serde::less_safe_secret_key_serde::deserialize  (JSON, "less safe" variant)
 op_crypto::ec, ::digest, ::uuid, ::trusted_device_auth::cpace_kdf
 op_crypto_aes::AesKey::decrypt_jwe_b_with_aad     (D: called by keychain decrypt)
 op_crypto_jwe::JweB, op_jose::jwk::{ec, symmetric}::Jwk
@@ -124,6 +127,9 @@ Facts: the keyset is **JOSE JWE with AAD binding**, decrypted with an `AesKey`, 
 the key material and an RSA keypair still present (legacy import/compat path). Key ids are
 derived at 16 and 32 bytes, and the Secret Key is a bespoke serialized type with its own serde
 module — i.e. versioned and length-checked, not a base32 string with a parser bolted on later.
+The serde module has an explicit `obfuscation::{obfuscate_key, deobfuscate}` pair (the masking
+that their own source comment admits is obfuscation, not protection), a `less_safe` JSON
+variant for export paths, and a `try_parse` entry point on the type itself.
 
 **GRIMOIRE decision update:** our spec uses XChaCha20-Poly1305 for values, which stands — but the
 *wrapping* layer should be JWE-shaped (`alg`/`enc` headers, AAD-bound, algorithm-agile) rather
