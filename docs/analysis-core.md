@@ -238,3 +238,27 @@ objdump -d --start-address=0x79c0e50 --stop-address=0x79c2650 "$S" \
 ```
 
 Raw symbol dumps: `/tmp/op_syms_index.txt` (2,965), `/tmp/op_syms_sdk.txt` (190) in WSL.
+
+---
+
+## 9. Tooling pitfall: `GccExceptionAnalyzer` on large Rust binaries
+
+Two attempts to decompile a single function from the 180 MB core both ended in
+`provider_timeout` — the second after a **7,200,000 ms** deadline. The 17 MB diagnostic bundle
+explains why, and the cause is not "the binary is big":
+
+```
+stdout log lines:        210,910
+distinct ERROR sources:  3, of which two are:
+  52,650 × "Function body does not fully contain the call site area (LSDACallSiteTable)"
+  52,650 × "Function body does not contain the landing pad (LSDACallSiteTable)"
+```
+
+That is Ghidra's `GccExceptionAnalyzer` walking Rust's unwind tables: two failed diagnostics per
+function body, ~105k log lines, in a binary where most functions have no LSDA to find. The run was
+still emitting them when the deadline fired.
+
+**Fix:** `REA_GHIDRA_DISABLED_ANALYZERS=GccExceptionAnalyzer` — the env var REA's own remediation
+text points at. Worth recording because the trap applies to any large non-C++ binary (Rust, Go, a
+stripped C blob), and because "raise the timeout" is the wrong first instinct when the log shows a
+repeating analyzer failure rather than slow progress.
