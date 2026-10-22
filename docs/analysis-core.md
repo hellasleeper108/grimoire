@@ -124,7 +124,28 @@ decrypt_jwe_b_with_aad ×2 (decrypt_keyset) · AesKey · RsaKeyPair (legacy path
 ```
 
 Facts: the keyset is **JOSE JWE with AAD binding**, decrypted with an `AesKey`, with EC JWKs in
-the key material and an RSA keypair still present (legacy import/compat path). Key ids are
+the key material and an RSA keypair still present (legacy import/compat path).
+
+The KDF primitives are linked from `ring`, visible in the same symbol table:
+
+```
+ring::pbkdf2::PBKDF2_HMAC_SHA256        the passphrase KDF
+ring::pbkdf2::PBKDF2_HMAC_SHA512
+ring::hmac::{HMAC_SHA256, HMAC_SHA384, HMAC_SHA512, HMAC_SHA1_FOR_LEGACY_USE_ONLY}
+ring::hkdf::{HKDF_SHA256, HKDF_SHA384}
+scrypt (crate)                          legacy import path
+aws_lc_rs::hkdf                         TLS only (rustls), not the vault chain
+```
+
+With the error variants already catalogued (`InvalidPbkdf2Iterations`,
+`SecretKey(BadFields | version | length)`, `DecryptionHashMismatch`,
+`UnexpectedEncryptionVersion`) and the tier-D finding that no iteration count is hard-coded at
+either keychain call site, the shape is: **PBKDF2-HMAC-SHA256(passphrase, salt, iterations read
+from the keyset) → HMAC-SHA256 mix with the Secret Key → unwrap the JOSE keyset → vault keys →
+per-item JWE-B**. The *order* in that sentence is inference from the primitives plus 1Password's
+published two-secret design, not a decompiler read-back — §7 says so explicitly.
+
+Key ids are
 derived at 16 and 32 bytes, and the Secret Key is a bespoke serialized type with its own serde
 module — i.e. versioned and length-checked, not a base32 string with a parser bolted on later.
 The serde module has an explicit `obfuscation::{obfuscate_key, deobfuscate}` pair (the masking
@@ -204,17 +225,14 @@ parsing gets its own UI. Matches our P1 being a whole phase, not a commit.
 
 ## 7. What this analysis did **not** settle
 
-1. **Exact derivation order.** We know the pieces (Secret Key serde, keychain keyset JWE, vault-key
-   wrap, `mk_kdf_params`) but not the order of operations. A tier-D pass has since narrowed it:
-   both `decrypt_keyset_using_bytes` and `decrypt_vault_key` call **`serde_json`** heavily (the
-   keyset is a JOSE JSON document, params carried inside it — hence the `InvalidPbkdf2Iterations`
-   error variant rather than a compile-time constant) and both call
-   **`unicode_normalization::decompose`**, i.e. the passphrase is Unicode-normalised before use.
-   `decrypt_vault_key` deserialises **`op_jose::jwk::symmetric::Jwk`** — the vault key is wrapped
-   with a `oct` (symmetric) JWK. No large immediates appear in either function, so no PBKDF2
-   iteration count is hard-coded at the call site. What is still missing is the *sequence*:
-   decompiled C for these two functions plus the sign-in path — REA `rea function` with Ghidra, or
-   `objdump` data-flow tracing through the GOT. Budget: 1–2 h, dominated by importing a 180 MB binary.
+1. **Exact derivation order.** Partially settled. The primitives are observed
+   (`ring::pbkdf2::PBKDF2_HMAC_SHA256`, `ring::hmac::HMAC_SHA256`, `ring::hkdf::HKDF_SHA256`,
+   `scrypt` for legacy imports), the container formats are observed (JOSE JSON keyset carrying its
+   own KDF params, `oct` JWK wrapping the vault key, JWE-B per item row), and the passphrase is
+   observed to be Unicode-normalised before use. The **sequence** is inference from those plus
+   the published two-secret design. Three decompile attempts failed on tooling, not on the target —
+   see §9 — so the residue is explicitly: *which function calls which, in what order*. For
+   GRIMOIRE this costs nothing, because our chain is Argon2id + HKDF rather than theirs.
 2. **Wire format.** `libop_sdk_lib_core.so` links `prost`/`prost_reflect`, so sync uses protobuf, but
    the embedded file descriptors are compressed inside the binary; only `google.proto` option types
    surfaced from strings. Naming the message types needs descriptor extraction (prost-reflect
@@ -258,7 +276,25 @@ That is Ghidra's `GccExceptionAnalyzer` walking Rust's unwind tables: two failed
 function body, ~105k log lines, in a binary where most functions have no LSDA to find. The run was
 still emitting them when the deadline fired.
 
-**Fix:** `REA_GHIDRA_DISABLED_ANALYZERS=GccExceptionAnalyzer` — the env var REA's own remediation
-text points at. Worth recording because the trap applies to any large non-C++ binary (Rust, Go, a
-stripped C blob), and because "raise the timeout" is the wrong first instinct when the log shows a
-repeating analyzer failure rather than slow progress.
+**Fix:** `REA_GHIDRA_DISABLED_ANALYZERS=...` — the env var REA's own remediation text points at.
+Worth recording because the trap applies to any large non-C++ binary (Rust, Go, a stripped C blob),
+and because "raise the timeout" is the wrong first instinct when the log shows a repeating analyzer
+failure rather than slow progress.
+
+**But the flag itself is hard to use, and that is the real finding.** REA validates the value with
+`bridge/ghidra/ReaGhidraAnalysisOptions.java`, which calls `analysis.getAnalyzer(name)` and
+requires `options.containsKey(name)` — i.e. it matches on Ghidra's **analysis-option name**, not the
+analyzer's Java class. Three attempts:
+
+| Value tried | Result |
+|---|---|
+| `GccExceptionAnalyzer` | `IllegalArgumentException: Unknown Ghidra analyzer for this program` |
+| `GCC Exception Analyzer` | same rejection |
+| enumerate the real names with a custom `GhidraScript` reading `currentProgram.getOptions("Analyzer")` | compiled and ran, printed **zero** option names |
+
+So the accepted string is undiscoverable from outside the running bridge, and a failed value aborts
+the whole run at pre-script time (cheap — 22 s — but useless). Two honest options remain: budget
+~5–6 h for an untouched run (52,650 of ~138,828 function bodies were processed in the first 2 h), or
+report the discoverability gap upstream. Separately, the reported deadline did not reconcile with
+observed wall clock (7,200,000 ms configured, ~35 min elapsed at last measurement), which also looks
+like a REA-side accounting bug worth filing.
