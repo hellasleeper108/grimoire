@@ -281,9 +281,9 @@ Properties this buys us:
 | Passphrase KDF | Argon2id, m=64 MiB, t=3, p=4, 32 B out | memory-hard; store params with the blob so they can rise over time |
 | Value AEAD | XChaCha20-Poly1305 (libsodium) | 24-byte nonce makes random nonces safe — no counter management, no GCM nonce-reuse footgun. 1Password uses AES-256-GCM; we deviate deliberately and document it |
 | Subkey derivation | HKDF-SHA256, per-purpose labels | one root, many keys, no key reuse across purposes |
-| Item/value wrapping | `AEAD(K_enc, IK)` with AAD = `vault_id ‖ item_id ‖ field_id` | binds ciphertext to its slot; blocks ciphertext relocation attacks |
+| Item/value wrapping | **JWE-shaped** (`alg`/`enc` headers, AAD = `vault_id ‖ item_id ‖ field_id`) instead of bare `AEAD(K_enc, IK)` | binds ciphertext to its slot, and buys algorithm agility + rotation for free; their keyset is JWE/AAD (`docs/analysis-core.md` §3) |
 | Signing (devices, audit) | Ed25519 | small, fast, audited |
-| Sharing envelopes | X25519 + HKDF → AEAD (sealed box) | P3 |
+| Sharing envelopes | **CPace** PAKE keyed by the human-transferred pairing code, then X25519-wrapped vault key | P3 — a PAKE closes the offline-guessing gap a bare sealed box leaves; matches their `trusted_device_auth::cpace_kdf` |
 | Leases / agent tokens | PASETO v4.public | 1Password uses PASETO in their SDK; it is the right shape: signed, versioned, no JWT footguns |
 | TOTP | RFC 6238, SHA-1/256/512, 6–8 digits, 30 s ±1 | interoperability with existing seeds |
 | Password generation | rejection-sampled CSPRNG, per-class rules, entropy readout | never modulo-biased |
@@ -305,8 +305,11 @@ the difference between "my passphrase was `hunter2`" and "my vault is unbreakabl
 2. Daemon unwraps the vault keyring, verifies a **canary blob** (AEAD of a fixed plaintext) —
    wrong passphrase fails here, not later.
 3. Session timer starts; `mlock` the key buffers; publish `session_unlocked`.
-4. Idle timeout (default 10 min) or `Ctrl-L` → zero keys, drop clipboard, publish
-   `session_locked`.
+4. Locking is driven by OS state, not a bare timer — compositor idle (Wayland
+   `ext-idle-notify` / X11 screensaver), session lock, and logind `PrepareForSleep` — with the
+   idle timeout (default 5 min) as the fallback when no compositor is present. Any of them, or
+   `Ctrl-L` → zero keys, drop clipboard, publish `session_locked`. On a bare TTY with no idle
+   source, the TUI says so in the status bar rather than pretending it will auto-lock.
 
 ### 4.5 Auth flow (when sync exists, P2)
 
@@ -323,7 +326,9 @@ timestamps are coarsened to the day.
 ```sql
 -- store is SQLCipher-encrypted; every *_enc column is additionally sealed with IK/VK
 vaults   (id, name_enc, icon, created_at, updated_at, version)
-items    (id, vault_id, category, template_version, title_enc, subtitle_enc,
+items    (id, vault_id, category, template_version,
+          overview_enc BLOB,      -- {title, subtitle, icon_ref, url_host, tags}  1 small AEAD value
+          detail_enc   BLOB,      -- {sections[], fields[], notes, attachments}   1 larger AEAD value
           created_at, updated_at, version, deleted_at NULL, favorite)
 item_keys(id, item_id, wrapped_ik BLOB)          -- IK wrapped by VK
 fields   (id, item_id, section_id, name_enc, field_type, value_enc,
@@ -342,6 +347,13 @@ Notes:
 - **Templates.** `category` + `template_version` select a JSON schema that defines sections,
   field names, field types and generators. 16 categories copied in *shape* from the categories
   observed in 1Password (§1.4) — the taxonomy is the useful part, the content is ours.
+- **Overview/detail split** (lesson from 1Password's `ItemOverview` / `ItemDetails` types and its
+  `ItemCache`): `overview_enc` is decrypted for every list row, `detail_enc` only for the selected
+  item. A bounded LRU keyed `(item_id, version)` sits in front of it, so a 5,000-row redraw costs
+  5,000 small AEAD opens and nothing else.
+- **Fields table is the grantable projection.** `detail_enc` is the authoritative body; the
+  `fields` rows carry individually wrapped values so a T1/T3 read can hand out exactly one field's
+  ciphertext without ever decrypting the item body.
 - **Search without leaking.** The `index` table holds encrypted tokens (HMAC'd trigrams under
   `K_index`). Fuzzy search runs over decrypted-in-memory tokens. Prefix search, typo distance ≤1,
   and no server-side index ever (P2 server holds no index at all).

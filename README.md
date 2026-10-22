@@ -7,6 +7,7 @@ grimoire/
 ├── README.md              ← you are here
 ├── DESIGN.md              ← the design: crypto, data model, TUI, sync, threat model, roadmap
 ├── EVIDENCE-1PASSWORD.md  ← what the 1Password reverse-engineering pass actually found
+├── docs/analysis-core.md  ← symbol-guided analysis of the 180 MB core binary (crate map, crypto, pairing)
 ├── evidence/              ← small verifiable receipts (REA output, inventories); raw 205 MB stays out
 └── .gitignore             ← vendor artifacts and raw evidence are never committed
 ```
