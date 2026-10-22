@@ -6,7 +6,7 @@ members = ["crates/grim-core", "crates/grim", "crates/grimd"]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
-license = "TBD"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/hellasleeper108/grimoire"
 
 [workspace.dependencies]

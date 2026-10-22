@@ -99,9 +99,13 @@ What P0a–P0c actually do: Argon2id + account-key derivation (§4.1), canary un
 with per-slot AAD, overview/detail split with per-item keys (§5), RFC 6238 TOTP, owner-only file
 permissions, and a daemon/socket split where the client cannot touch the store (§2, §3.2).
 
-What it does **not** do yet: the ratatui TUI, search index, import/export, sync, shares, leases, and
-`SO_PEERCRED` peer checks (the socket's `0600` + `0700` directory is currently the whole access
-control). Each is a phase, not a stub.
+What it does **not** do yet: search index, import/export, sync, shares, leases, and a CLI-consent
+prompt for one-shot reads (today a client that can open the socket may read any field the daemon
+will hand it). Each is a phase, not a stub.
+
+Access control, in order of application: the socket is `0600` inside a `0700` directory, **and**
+every accepted connection is checked with `SO_PEERCRED` against the daemon's effective uid before a
+single byte of the request is parsed.
 
 **Reproduce the study:** `EVIDENCE-1PASSWORD.md` §6. REA evidence lives in
 `~/rea-work/1password/evidence/` inside WSL.
@@ -114,9 +118,14 @@ byte from 1Password appears in this design — see `EVIDENCE-1PASSWORD.md` §7.
 
 - Remote: `git@github.com:hellasleeper108/grimoire.git` (SSH, key already trusted by GitHub)
 - Branch: `main`
-- **Licence: TBD.** Nothing is granted yet. Note that most shipping password managers are
-  copyleft (KeePass GPL-2.0, Bitwarden GPL-3.0, `pass` GPL-2.0+), and this project is a study of
-  a proprietary product — pick deliberately, not by default.
+- **Licence: GPL-3.0-or-later.** Chosen deliberately: a password manager is a security tool people
+  are asked to trust with their whole digital life, and the copyleft guarantees that any version
+  they run can be audited. It also matches the field (Bitwarden GPL-3.0, KeePass GPL-2.0, `pass`
+  GPL-2.0+). If you need to embed `grim-core` in something proprietary, MIT/Apache-2.0 would have
+  been the choice — that trade was made deliberately, not by default.
+- **The study is not the product.** `EVIDENCE-1PASSWORD.md` and `docs/analysis-core.md` record an
+  independent reverse-engineering study of a proprietary product. No code, assets, templates or
+  protocol bytes from 1Password are included; the licence above covers only original work here.
 - Commit style: subject line ≤ 72 chars, imperative, body explains *why*.
 
 ## Provenance

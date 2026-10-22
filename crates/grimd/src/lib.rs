@@ -130,14 +130,64 @@ impl State {
     }
 }
 
+/// The effective uid of this process (Linux/Unix).
+pub fn own_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// uid of the process on the other end of a connected AF_UNIX socket.
+///
+/// `0600` on the socket is a filesystem check performed once, at connect time, by the kernel; this
+/// is the same check re-asserted on the accepted connection, so a path swapped or a pre-opened
+/// descriptor can't outlive a change in ownership.
+#[cfg(target_os = "linux")]
+pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: cred/len are valid for writes for the duration of the call, and SO_PEERCRED on a
+    // connected AF_UNIX socket writes exactly one ucred.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(cred.uid)
+}
+
 /// Accept loop. One thread per connection, one request per connection.
+///
+/// Connections from a different uid are refused before any request is parsed.
 #[cfg(unix)]
 pub fn serve(listener: std::os::unix::net::UnixListener, state: Arc<Mutex<State>>) {
     for conn in listener.incoming() {
-        let stream = match conn {
+        let mut stream = match conn {
             Ok(s) => s,
             Err(_) => continue,
         };
+
+        #[cfg(target_os = "linux")]
+        {
+            let allowed = matches!(peer_uid(&stream), Ok(uid) if uid == own_uid());
+            if !allowed {
+                let msg = serde_json::to_string(&Response::Error {
+                    message: "peer rejected: socket is owner-only".into(),
+                })
+                .unwrap_or_else(|_| "{\"kind\":\"error\"}".to_string());
+                let _ = writeln!(stream, "{msg}");
+                continue;
+            }
+        }
+
         let shared = Arc::clone(&state);
         std::thread::spawn(move || {
             let snapshot = match stream.try_clone() {
@@ -190,4 +240,46 @@ pub fn prepare_socket(path: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_uid_reports_this_process() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_eq!(peer_uid(&a).unwrap(), own_uid());
+    }
+
+    #[test]
+    fn locked_state_refuses_data_verbs_but_answers_status() {
+        let mut st = State::new("/nonexistent/vault.db".into(), AccountKey::generate());
+        assert!(st.is_locked());
+
+        match st.handle(Request::ListItems).0 {
+            Response::Error { message } => assert!(message.contains("locked"), "{message}"),
+            other => panic!("expected a locked refusal, got {other:?}"),
+        }
+        assert!(matches!(
+            st.handle(Request::Status).0,
+            Response::Status { locked: true, .. }
+        ));
+    }
+
+    #[test]
+    fn unlock_against_a_missing_vault_fails_and_stays_locked() {
+        let mut st = State::new("/nonexistent/vault.db".into(), AccountKey::generate());
+        let (resp, stop) = st.handle(Request::Unlock { passphrase: "x".into() });
+        assert!(matches!(resp, Response::Error { .. }));
+        assert!(!stop);
+        assert!(st.is_locked());
+    }
+
+    #[test]
+    fn quit_stops_the_daemon() {
+        let mut st = State::new("/nonexistent/vault.db".into(), AccountKey::generate());
+        assert!(st.handle(Request::Quit).1);
+    }
 }

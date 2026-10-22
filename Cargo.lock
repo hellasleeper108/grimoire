@@ -490,6 +490,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "grim-core",
+ "libc",
  "serde_json",
 ]
 
