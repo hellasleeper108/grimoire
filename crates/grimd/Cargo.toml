@@ -1,0 +1,21 @@
+[package]
+name = "grimd"
+description = "GRIMOIRE daemon: owns the keys, answers capability verbs over a Unix socket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "grimd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "grimd"
+path = "src/main.rs"
+
+[dependencies]
+grim-core = { path = "../grim-core" }
+clap = { version = "4", features = ["derive"] }
+serde_json.workspace = true

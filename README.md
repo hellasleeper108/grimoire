@@ -30,30 +30,43 @@ Read in this order:
 3. `DESIGN.md` §6 — the actual TUI: layout, keys, states.
 4. `EVIDENCE-1PASSWORD.md` — the receipts, including where the tooling came up short.
 
-**Status:** design + **P0a implemented**. `grim-core` and the `grim` CLI work end to end for a
-local vault; no TUI, no daemon, no sync yet. Phases P0–P5 in `DESIGN.md` §10.
+**Status:** design + **P0b implemented**. `grim-core` (crypto + store), `grimd` (daemon that owns
+keys and answers a closed verb set over a Unix socket) and `grim` (client with no keys, no SQL).
+No TUI, no sync yet. Phases P0–P5 in `DESIGN.md` §10.
 
 ## Build and run
 
 ```bash
-cargo test                                  # 9 tests: crypto, store, AAD binding, TOTP vector
+cargo test                                  # 15 tests: crypto, store, daemon lifecycle, locked gate
 cargo build --release
+
 export GRIM_PASSPHRASE='…'                  # or omit to be prompted
 ./target/release/grim init                  # prints the recovery kit ONCE
+
+./target/release/grimd &                    # the only process that holds keys
+./target/release/grim status                # -> locked
+./target/release/grim unlock
 ./target/release/grim add --title github --username you --password '…' \
     --url https://github.com --totp JBSWY3DPEHPK3PXP
 ./target/release/grim list                  # overviews only — the cheap half
 ./target/release/grim get github            # fields masked
 GRIM_REVEAL=1 ./target/release/grim get github --field password
 ./target/release/grim totp github
+./target/release/grim lock                  # drops the keys; every data verb then refuses
+./target/release/grim quit                  # stops the daemon
 ```
 
-What P0a actually does: Argon2id + account-key derivation (§4.1), canary unlock, XChaCha20-Poly1305
-with per-slot AAD, overview/detail split with per-item keys (§5), RFC 6238 TOTP, owner-only file
-permissions.
+A locked daemon answers exactly four verbs (`status`, `unlock`, `quit`, and its own error), and the
+socket lives at `$XDG_RUNTIME_DIR/grimoire/grimd.sock` with mode `0600` inside a `0700` directory.
+`grim` fails loudly if the daemon is not running — it never falls back to opening the vault itself.
 
-What it does **not** do yet: `grimd` and the capability/socket layer, the ratatui TUI, search
-index, import/export, sync, shares, leases. Each is a phase, not a stub.
+What P0a–P0b actually do: Argon2id + account-key derivation (§4.1), canary unlock, XChaCha20-Poly1305
+with per-slot AAD, overview/detail split with per-item keys (§5), RFC 6238 TOTP, owner-only file
+permissions, and a daemon/socket split where the client cannot touch the store (§2, §3.2).
+
+What it does **not** do yet: the ratatui TUI, search index, import/export, sync, shares, leases, and
+`SO_PEERCRED` peer checks (the socket's `0600` + `0700` directory is currently the whole access
+control). Each is a phase, not a stub.
 
 **Reproduce the study:** `EVIDENCE-1PASSWORD.md` §6. REA evidence lives in
 `~/rea-work/1password/evidence/` inside WSL.

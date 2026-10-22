@@ -1,27 +1,33 @@
 //! `grim` — the GRIMOIRE client.
 //!
-//! P0a: the client speaks to `grim-core` in-process. The daemon (`grimd`) and the
-//! Unix-socket capability layer are the next increment; the core API is already shaped for it
-//! (Vault::open / list / get / field / totp are the verbs, not SQL).
+//! Since P0b the client holds no keys and opens no database: every operation is a capability
+//! verb sent to `grimd` (DESIGN §2). If the daemon isn't running this fails loudly rather than
+//! quietly falling back to touching the vault in-process.
+//!
+//! `init` is the one exception: it *creates* the vault, so it runs before any daemon exists.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use grim_core::{AccountKey, Category, Detail, Field, FieldKind, Overview, Vault, VaultParams};
+use grim_core::protocol::{call, Request, Response};
+use grim_core::{Detail, Error, Field, FieldKind, Overview, Result, Vault, VaultParams};
 
 #[derive(Parser)]
 #[command(name = "grim", version, about = "GRIMOIRE — a book of secret names")]
 struct Cli {
-    /// Vault file (default: ~/.local/share/grimoire/vault.db)
+    /// Daemon socket (default: $XDG_RUNTIME_DIR/grimoire/grimd.sock)
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
+    /// Vault file (used by `init` only)
     #[arg(long, global = true)]
     vault: Option<PathBuf>,
-    /// Account key file (default: ~/.config/grimoire/account.key)
+    /// Account key file (used by `init` only)
     #[arg(long, global = true)]
     key: Option<PathBuf>,
-    /// Never print secrets unmasked
+    /// Print secrets unmasked
     #[arg(long, global = true)]
-    no_reveal: bool,
+    reveal: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -30,6 +36,22 @@ struct Cli {
 enum Cmd {
     /// Create a new vault and print the recovery kit (shown once)
     Init,
+    /// Daemon state: locked or not, item count, vault path
+    Status,
+    /// Unlock the daemon (passphrase from GRIM_PASSPHRASE or prompt)
+    Unlock,
+    /// Drop the keys
+    Lock,
+    /// List items (overviews only)
+    List,
+    /// Read one item, or one field of it
+    Get {
+        needle: String,
+        #[arg(long)]
+        field: Option<String>,
+    },
+    /// Current TOTP code for an item
+    Totp { needle: String },
     /// Add an item
     Add {
         #[arg(long, default_value = "login")]
@@ -47,51 +69,36 @@ enum Cmd {
         #[arg(long)]
         notes: Option<String>,
     },
-    /// List items (overviews only — the cheap half of the split)
-    List,
-    /// Read one item, or one field of it
-    Get {
-        needle: String,
-        #[arg(long)]
-        field: Option<String>,
-    },
-    /// Show the current TOTP code for an item
-    Totp { needle: String },
-}
-
-fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("grim: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn vault_path(v: &Option<PathBuf>) -> PathBuf {
-    v.clone().unwrap_or_else(|| data_dir().join("vault.db"))
-}
-
-fn key_path(k: &Option<PathBuf>) -> PathBuf {
-    k.clone().unwrap_or_else(|| config_dir().join("account.key"))
+    /// Stop the daemon
+    Quit,
 }
 
 fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn data_dir() -> PathBuf {
-    home().join(".local/share/grimoire")
+fn socket_path(cli: &Cli) -> PathBuf {
+    cli.socket.clone().unwrap_or_else(|| {
+        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+            let mut p = PathBuf::from(runtime);
+            p.push("grimoire/grimd.sock");
+            p
+        } else {
+            home().join(".local/share/grimoire/grimd.sock")
+        }
+    })
 }
 
-fn config_dir() -> PathBuf {
-    home().join(".config/grimoire")
+fn default_vault() -> PathBuf {
+    home().join(".local/share/grimoire/vault.db")
+}
+
+fn default_key() -> PathBuf {
+    home().join(".config/grimoire/account.key")
 }
 
 /// Passphrase from `GRIM_PASSPHRASE` when set (scripting), otherwise a hidden prompt.
-fn passphrase(confirm: bool) -> grim_core::Result<String> {
+fn passphrase(confirm: bool) -> Result<String> {
     if let Ok(p) = std::env::var("GRIM_PASSPHRASE") {
         if !p.is_empty() {
             return Ok(p);
@@ -99,20 +106,15 @@ fn passphrase(confirm: bool) -> grim_core::Result<String> {
     }
     let first = rpassword::prompt_password("passphrase: ").unwrap_or_default();
     if first.is_empty() {
-        return Err(grim_core::Error::BadCredentials);
+        return Err(Error::BadCredentials);
     }
     if confirm {
         let second = rpassword::prompt_password("again: ").unwrap_or_default();
         if first != second {
-            return Err(grim_core::Error::BadCredentials);
+            return Err(Error::BadCredentials);
         }
     }
     Ok(first)
-}
-
-fn read_account_key(path: &PathBuf) -> grim_core::Result<AccountKey> {
-    let raw = std::fs::read_to_string(path)?;
-    AccountKey::parse(raw.trim())
 }
 
 fn write_private(path: &PathBuf, contents: &str) -> std::io::Result<()> {
@@ -130,133 +132,187 @@ fn write_private(path: &PathBuf, contents: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn run(cli: Cli) -> grim_core::Result<()> {
-    let Cli { vault, key, no_reveal, cmd } = cli;
-    let reveal = !no_reveal && std::env::var_os("GRIM_REVEAL").is_some_and(|v| v == "1");
-    match cmd {
-        Cmd::Init => {
-            let vpath = vault_path(&vault);
-            if vpath.exists() {
-                eprintln!("grim: vault already exists at {}", vpath.display());
-                return Err(grim_core::Error::BadCredentials);
-            }
-            let pass = passphrase(true)?;
-            let (_vault, account_key) = Vault::create(&vpath, &pass, VaultParams::default())?;
-            let recovery = account_key.to_recovery_string();
-            write_private(&key_path(&key), &recovery)?;
-            println!("vault created: {}", vpath.display());
-            println!();
-            println!("  RECOVERY KIT — write this down, it is not recoverable:");
-            println!("    account key:  {recovery}");
-            println!();
-            println!("  A copy is on this device at {} (0600).", key_path(&key).display());
-            println!("  The vault is unreadable without BOTH the passphrase and this key.");
-        }
-        Cmd::Add { category, title, username, password, url, totp, notes } => {
-            let cat = Category::parse(&category).ok_or_else(|| {
-                grim_core::Error::UnknownField(format!("category {category:?}"))
-            })?;
-            let pass = passphrase(false)?;
-            let ak = read_account_key(&key_path(&key))?;
-            let mut vault = Vault::open(&vault_path(&vault), &pass, &ak)?;
+fn ok_or_daemon_error(resp: Response) -> Result<Response> {
+    match resp {
+        Response::Error { message } => Err(Error::Daemon(message)),
+        other => Ok(other),
+    }
+}
 
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(&cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("grim: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: &Cli) -> Result<()> {
+    let reveal = cli.reveal || std::env::var_os("GRIM_REVEAL").is_some_and(|v| v == "1");
+
+    // Vault creation happens before any daemon exists, so this one verb stays local.
+    if matches!(cli.cmd, Cmd::Init) {
+        let vpath = cli.vault.clone().unwrap_or_else(default_vault);
+        if vpath.exists() {
+            return Err(Error::Daemon(format!("vault already exists at {}", vpath.display())));
+        }
+        let pass = passphrase(true)?;
+        let (_vault, account_key) = Vault::create(&vpath, &pass, VaultParams::default())?;
+        let recovery = account_key.to_recovery_string();
+        let keyfile = cli.key.clone().unwrap_or_else(default_key);
+        write_private(&keyfile, &recovery)?;
+        println!("vault created: {}", vpath.display());
+        println!();
+        println!("  RECOVERY KIT — write this down, it is not recoverable:");
+        println!("    account key:  {recovery}");
+        println!();
+        println!("  A copy is on this device at {} (0600).", keyfile.display());
+        println!("  The vault is unreadable without BOTH the passphrase and this key.");
+        return Ok(());
+    }
+
+    let sock = socket_path(cli);
+    let req = match &cli.cmd {
+        Cmd::Init => unreachable!("handled above"),
+        Cmd::Status => Request::Status,
+        Cmd::Unlock => Request::Unlock { passphrase: passphrase(false)? },
+        Cmd::Lock => Request::Lock,
+        Cmd::List => Request::ListItems,
+        Cmd::Get { needle, field } => match field {
+            Some(f) => Request::RevealField { needle: needle.clone(), field: f.clone() },
+            None => Request::GetItem { needle: needle.clone() },
+        },
+        Cmd::Totp { needle } => Request::TotpNow { needle: needle.clone() },
+        Cmd::Quit => Request::Quit,
+        Cmd::Add { category, title, username, password, url, totp, notes } => {
             let mut fields = Vec::new();
             if let Some(u) = username {
-                fields.push(Field { name: "username".into(), kind: FieldKind::Text, value: u, conceal: false });
+                fields.push(Field {
+                    name: "username".into(),
+                    kind: FieldKind::Text,
+                    value: u.clone(),
+                    conceal: false,
+                });
             }
             if let Some(p) = password {
-                fields.push(Field { name: "password".into(), kind: FieldKind::Password, value: p, conceal: true });
+                fields.push(Field {
+                    name: "password".into(),
+                    kind: FieldKind::Password,
+                    value: p.clone(),
+                    conceal: true,
+                });
             }
             if let Some(t) = totp {
-                fields.push(Field { name: "totp".into(), kind: FieldKind::Totp, value: t, conceal: true });
+                fields.push(Field {
+                    name: "totp".into(),
+                    kind: FieldKind::Totp,
+                    value: t.clone(),
+                    conceal: true,
+                });
             }
-            if let Some(u) = url.clone() {
-                fields.push(Field { name: "url".into(), kind: FieldKind::Url, value: u, conceal: false });
+            if let Some(u) = url {
+                fields.push(Field {
+                    name: "url".into(),
+                    kind: FieldKind::Url,
+                    value: u.clone(),
+                    conceal: false,
+                });
             }
-
-            let overview = Overview {
-                title,
-                subtitle: username_or_empty(&fields),
-                url_host: url.as_deref().map(host_of).unwrap_or_default(),
-                tags: Vec::new(),
-                favorite: false,
-            };
-            let detail = Detail { fields, notes: notes.unwrap_or_default() };
-            let id = vault.insert(cat, &overview, &detail)?;
-            println!("{}", &id[..8]);
+            Request::AddItem {
+                category: category.clone(),
+                overview: Overview {
+                    title: title.clone(),
+                    subtitle: username.clone().unwrap_or_default(),
+                    url_host: url.as_deref().map(host_of).unwrap_or_default(),
+                    tags: Vec::new(),
+                    favorite: false,
+                },
+                detail: Detail { fields, notes: notes.clone().unwrap_or_default() },
+            }
         }
-        Cmd::List => {
-            let pass = passphrase(false)?;
-            let ak = read_account_key(&key_path(&key))?;
-            let vault = Vault::open(&vault_path(&vault), &pass, &ak)?;
-            let items = vault.list()?;
+    };
+
+    let resp = ok_or_daemon_error(call(&sock, &req)?)?;
+    render(cli, resp, reveal)
+}
+
+fn render(cli: &Cli, resp: Response, reveal: bool) -> Result<()> {
+    match resp {
+        Response::Ok => println!("ok"),
+        Response::Status { locked, items, vault } => {
+            println!("state:  {}", if locked { "locked" } else { "unlocked" });
+            println!("vault:  {vault}");
+            if !locked {
+                println!("items:  {items}");
+            }
+        }
+        Response::Items { items } => {
             println!("{:<10} {:<11} {}", "ID", "CATEGORY", "TITLE  (subtitle)");
-            for (id, cat, ov) in &items {
-                let sub = if ov.subtitle.is_empty() { String::new() } else { format!("  ({})", ov.subtitle) };
-                println!("{:<10} {:<11} {}{}", &id[..8], cat.as_str(), ov.title, sub);
+            for row in &items {
+                let sub = if row.subtitle.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({})", row.subtitle)
+                };
+                println!("{:<10} {:<11} {}{}", short(&row.id), row.category, row.title, sub);
             }
             println!("\n{} item(s)", items.len());
         }
-        Cmd::Get { needle, field } => {
-            let pass = passphrase(false)?;
-            let ak = read_account_key(&key_path(&key))?;
-            let vault = Vault::open(&vault_path(&vault), &pass, &ak)?;
-            let (id, cat, ov, detail) = vault.get(&needle)?;
-            match field {
-                Some(name) => {
-                    let f = detail
-                        .fields
-                        .iter()
-                        .find(|f| f.name.eq_ignore_ascii_case(&name))
-                        .ok_or_else(|| grim_core::Error::UnknownField(name.clone()))?;
-                    println!("{}", mask_if(f, reveal));
+        Response::Item { id, category, overview, detail } => match requested_field(cli) {
+            Some(name) => {
+                let f = detail
+                    .fields
+                    .iter()
+                    .find(|x| x.name.eq_ignore_ascii_case(&name))
+                    .ok_or_else(|| Error::UnknownField(name.clone()))?;
+                println!("{}", mask(f, reveal));
+            }
+            None => {
+                println!("{}  [{}]  {}", short(&id), category, overview.title);
+                if !overview.url_host.is_empty() {
+                    println!("url_host: {}", overview.url_host);
                 }
-                None => {
-                    println!("{}  [{}]  {}", &id[..8], cat.as_str(), ov.title);
-                    if !ov.url_host.is_empty() {
-                        println!("url_host: {}", ov.url_host);
-                    }
-                    for f in &detail.fields {
-                        println!("{:<10} {}", f.name, mask_if(f, reveal));
-                    }
-                    if !detail.notes.is_empty() {
-                        println!("\nnotes:\n{}", detail.notes);
-                    }
+                for f in &detail.fields {
+                    println!("{:<10} {}", f.name, mask(f, reveal));
+                }
+                if !detail.notes.is_empty() {
+                    println!("\nnotes:\n{}", detail.notes);
                 }
             }
-        }
-        Cmd::Totp { needle } => {
-            let pass = passphrase(false)?;
-            let ak = read_account_key(&key_path(&key))?;
-            let vault = Vault::open(&vault_path(&vault), &pass, &ak)?;
-            let (code, remaining) = vault.totp(&needle)?;
-            println!("{code}  ({remaining}s left)");
-        }
+        },
+        Response::Value { value } => println!("{value}"),
+        Response::Totp { code, remaining } => println!("{code}  ({remaining}s left)"),
+        Response::Added { id } => println!("{}", short(&id)),
+        Response::Error { message } => return Err(Error::Daemon(message)),
     }
     Ok(())
 }
 
-fn username_or_empty(fields: &[Field]) -> String {
-    fields
-        .iter()
-        .find(|f| f.name == "username")
-        .map(|f| f.value.clone())
-        .unwrap_or_default()
+fn requested_field(cli: &Cli) -> Option<String> {
+    match &cli.cmd {
+        Cmd::Get { field, .. } => field.clone(),
+        _ => None,
+    }
+}
+
+fn short(id: &str) -> &str {
+    &id[..id.len().min(8)]
 }
 
 fn host_of(url: &str) -> String {
-    url.split("://")
-        .nth(1)
-        .unwrap_or(url)
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .to_string()
+    url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("").to_string()
 }
 
-fn mask_if(f: &Field, reveal: bool) -> String {
+fn mask(f: &Field, reveal: bool) -> String {
     if f.conceal && !reveal {
-        format!("{}…  ({} chars; --reveal / GRIM_REVEAL=1 to show)", "•".repeat(8.min(f.value.len())), f.value.len())
+        format!(
+            "{}…  ({} chars; --reveal or GRIM_REVEAL=1 to show)",
+            "•".repeat(8.min(f.value.len())),
+            f.value.len()
+        )
     } else {
         f.value.clone()
     }

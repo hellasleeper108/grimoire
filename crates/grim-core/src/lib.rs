@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
+pub mod protocol;
 pub mod store;
 pub use store::{Vault, VaultParams};
 
@@ -42,6 +43,8 @@ pub enum Error {
     Kdf(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("daemon: {0}")]
+    Daemon(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
