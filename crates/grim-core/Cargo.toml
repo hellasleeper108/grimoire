@@ -1,0 +1,27 @@
+[package]
+name = "grim-core"
+description = "GRIMOIRE core: key derivation, envelope encryption, encrypted item store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+argon2.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+base32.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true

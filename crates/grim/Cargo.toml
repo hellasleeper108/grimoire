@@ -1,0 +1,18 @@
+[package]
+name = "grim"
+description = "GRIMOIRE command-line client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "grim"
+path = "src/main.rs"
+
+[dependencies]
+grim-core = { path = "../grim-core" }
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+serde_json.workspace = true

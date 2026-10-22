@@ -9,6 +9,9 @@ grimoire/
 ├── EVIDENCE-1PASSWORD.md  ← what the 1Password reverse-engineering pass actually found
 ├── docs/analysis-core.md  ← symbol-guided analysis of the 180 MB core binary (crate map, crypto, pairing)
 ├── evidence/              ← small verifiable receipts (REA output, inventories); raw 205 MB stays out
+├── crates/grim-core/      ← crypto + encrypted store (the fat core)
+├── crates/grim/           ← CLI client
+├── Cargo.toml             ← workspace
 └── .gitignore             ← vendor artifacts and raw evidence are never committed
 ```
 
@@ -27,7 +30,30 @@ Read in this order:
 3. `DESIGN.md` §6 — the actual TUI: layout, keys, states.
 4. `EVIDENCE-1PASSWORD.md` — the receipts, including where the tooling came up short.
 
-**Status:** design only, nothing built. Phases P0–P5 in `DESIGN.md` §10.
+**Status:** design + **P0a implemented**. `grim-core` and the `grim` CLI work end to end for a
+local vault; no TUI, no daemon, no sync yet. Phases P0–P5 in `DESIGN.md` §10.
+
+## Build and run
+
+```bash
+cargo test                                  # 9 tests: crypto, store, AAD binding, TOTP vector
+cargo build --release
+export GRIM_PASSPHRASE='…'                  # or omit to be prompted
+./target/release/grim init                  # prints the recovery kit ONCE
+./target/release/grim add --title github --username you --password '…' \
+    --url https://github.com --totp JBSWY3DPEHPK3PXP
+./target/release/grim list                  # overviews only — the cheap half
+./target/release/grim get github            # fields masked
+GRIM_REVEAL=1 ./target/release/grim get github --field password
+./target/release/grim totp github
+```
+
+What P0a actually does: Argon2id + account-key derivation (§4.1), canary unlock, XChaCha20-Poly1305
+with per-slot AAD, overview/detail split with per-item keys (§5), RFC 6238 TOTP, owner-only file
+permissions.
+
+What it does **not** do yet: `grimd` and the capability/socket layer, the ratatui TUI, search
+index, import/export, sync, shares, leases. Each is a phase, not a stub.
 
 **Reproduce the study:** `EVIDENCE-1PASSWORD.md` §6. REA evidence lives in
 `~/rea-work/1password/evidence/` inside WSL.
