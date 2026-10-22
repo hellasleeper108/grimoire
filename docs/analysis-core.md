@@ -199,10 +199,16 @@ parsing gets its own UI. Matches our P1 being a whole phase, not a commit.
 ## 7. What this analysis did **not** settle
 
 1. **Exact derivation order.** We know the pieces (Secret Key serde, keychain keyset JWE, vault-key
-   wrap, `mk_kdf_params`) but not the order of operations or the KDF parameters actually used.
-   Settling that needs decompiled C for ~3 functions (`decrypt_keyset_using_bytes`,
-   `decrypt_vault_key`, and the sign-in path) — REA `rea function` with Ghidra, or `objdump` data-flow
-   tracing through the GOT. Budget: 1–2 h, dominated by importing a 180 MB binary.
+   wrap, `mk_kdf_params`) but not the order of operations. A tier-D pass has since narrowed it:
+   both `decrypt_keyset_using_bytes` and `decrypt_vault_key` call **`serde_json`** heavily (the
+   keyset is a JOSE JSON document, params carried inside it — hence the `InvalidPbkdf2Iterations`
+   error variant rather than a compile-time constant) and both call
+   **`unicode_normalization::decompose`**, i.e. the passphrase is Unicode-normalised before use.
+   `decrypt_vault_key` deserialises **`op_jose::jwk::symmetric::Jwk`** — the vault key is wrapped
+   with a `oct` (symmetric) JWK. No large immediates appear in either function, so no PBKDF2
+   iteration count is hard-coded at the call site. What is still missing is the *sequence*:
+   decompiled C for these two functions plus the sign-in path — REA `rea function` with Ghidra, or
+   `objdump` data-flow tracing through the GOT. Budget: 1–2 h, dominated by importing a 180 MB binary.
 2. **Wire format.** `libop_sdk_lib_core.so` links `prost`/`prost_reflect`, so sync uses protobuf, but
    the embedded file descriptors are compressed inside the binary; only `google.proto` option types
    surfaced from strings. Naming the message types needs descriptor extraction (prost-reflect
