@@ -11,7 +11,7 @@ selected functions. Evidence tiers are labelled per section:
 |---|---|---|
 | **S** | symbol table (`nm`), exact names as the compiler emitted them | high for *what exists*, weak for *behaviour* |
 | **D** | disassembly call targets (`objdump`) | good for *which routines a function reaches*, blind to indirect calls |
-| **R** | REA/Ghidra decompiler evidence | not used here except `evidence/rea-ghidra-1password-mcp.json` |
+| **R** | REA/Ghidra decompiler evidence | **not used for this 180 MB target** — available only for the companion binaries: `evidence/rea-ghidra-1password-mcp.json` (4,587 procedures) and `evidence/rea-ghidra-browsersupport.json` (6,485 procedures, `ev_d711ea77…`) |
 | **I** | inference from naming — clearly marked | hypothesis, not fact |
 
 No decompiler was run on the 180 MB binary. Why: 138,828 functions, of which only 2,965 unique

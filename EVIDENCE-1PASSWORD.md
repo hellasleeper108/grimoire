@@ -111,6 +111,23 @@ strings:     7,476
 ~9 minutes of Ghidra under a 30-minute deadline, versus the 330 s default that killed it.
 `1Password-BrowserSupport` (7.7 MB, ~6 040 symbols) relaunched second in the same job.
 
+**Relaunch result — `1Password-BrowserSupport` also completed** (job total 1 752 s for both):
+
+```yaml
+evidence_id: ev_d711ea77928fd6f9eb270acc23b9019715a9184e5efead43acf6dbe253b5390b
+subject:     1Password-BrowserSupport · sha256 fd733e9b00ca639e55f4bb39c4c62fa1b84ddd80698b62ea731813729c6a56b1
+provider:    rea-workflow → upstream ghidra 12.1.4
+format/arch: elf / x86_64
+segments:    37
+procedures:  6,485
+strings:     10,910
+confidence:  derived · 8 documented limitations
+```
+Both receipts are committed under `evidence/` as `rea-ghidra-1password-mcp.json` and
+`rea-ghidra-browsersupport.json`. These two runs are the only decompiler-tier (R) evidence in the
+study; everything about the 180 MB core in `docs/analysis-core.md` is symbol-table tier (S/D) by
+design.
+
 ---
 
 ## 3. The IPC surface (manual read of `preload.js`, 2,994 bytes)
