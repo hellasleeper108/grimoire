@@ -1,0 +1,27 @@
+# vendor / study artifacts — never committed
+*.asar
+*.asar.unpacked/
+*.tar.gz
+*.zip
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.node
+*.so
+*.exe
+*.log
+
+# raw REA evidence (reproducible, hundreds of MB)
+raw/
+evidence/*-raw/
+evidence/asar.json
+evidence/*.err
+
+# build / editor
+target/
+node_modules/
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

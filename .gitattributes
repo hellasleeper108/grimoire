@@ -1,0 +1,12 @@
+# Normalise line endings in the repo; keep binaries out of diffing.
+* text=auto eol=lf
+
+*.rs   text diff=rust
+*.toml text
+*.md   text
+*.json text
+*.txt  text
+
+# evidence receipts are generated, not hand-edited
+evidence/*.json linguist-generated=true
+evidence/*.txt  linguist-generated=true
