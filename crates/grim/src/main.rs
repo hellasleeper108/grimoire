@@ -192,8 +192,7 @@ fn run(cli: &Cli) -> Result<()> {
 
     // Import: parse and report locally, then hand the daemon one atomic batch.
     if let Cmd::Import { path, dry_run } = &cli.cmd {
-        let content = std::fs::read_to_string(path)?;
-        let report = grim_core::import::parse(&path.to_string_lossy(), &content);
+        let report = grim_core::import::parse_path(path)?;
         print_report(&report, *dry_run);
 
         // A refused file never reaches the vault.

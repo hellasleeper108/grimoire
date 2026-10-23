@@ -54,12 +54,17 @@ impl ImportReport {
 pub enum Format {
     Csv,
     Bitwarden,
+    /// 1Password's `.1pux` archive: a zip whose `export.data` is the JSON export.
+    OnePux,
 }
 
 impl Format {
     /// Guess from the file name first, then from the first non-space byte.
     pub fn detect(name: &str, content: &str) -> Format {
         let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".1pux") || lower.ends_with(".1pif") {
+            return Format::OnePux;
+        }
         if lower.ends_with(".json") {
             return Format::Bitwarden;
         }
@@ -74,10 +79,28 @@ impl Format {
     }
 }
 
+/// Read a file and parse it, handling the binary 1PUX case.
+pub fn parse_path(path: &std::path::Path) -> std::io::Result<ImportReport> {
+    let bytes = std::fs::read(path)?;
+    let name = path.to_string_lossy().to_ascii_lowercase();
+    // zip magic: "PK\x03\x04" — trust the bytes over the extension
+    if name.ends_with(".1pux") || bytes.starts_with(b"PK\x03\x04") {
+        return Ok(parse_1pux(&bytes));
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(parse(&name, &text))
+}
+
 pub fn parse(name: &str, content: &str) -> ImportReport {
     match Format::detect(name, content) {
         Format::Csv => parse_csv(content),
         Format::Bitwarden => parse_bitwarden(content),
+        Format::OnePux => {
+            // a .1pux is a zip: it cannot be read from a &str
+            let mut report = ImportReport::default();
+            report.refuse("a .1pux archive is binary; use import::parse_path to read it");
+            report
+        }
     }
 }
 
@@ -320,6 +343,272 @@ pub fn parse_bitwarden(content: &str) -> ImportReport {
     report
 }
 
+// ------------------------------------------------------------------ 1PUX
+
+#[derive(Debug, Deserialize)]
+struct PuxExport {
+    #[serde(default)]
+    accounts: Vec<PuxAccount>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PuxAccount {
+    #[serde(default)]
+    vaults: Vec<PuxVault>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PuxVault {
+    #[serde(default)]
+    items: Vec<PuxItem>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PuxItem {
+    #[serde(default, rename = "categoryUuid")]
+    category_uuid: Option<String>,
+    #[serde(default)]
+    overview: PuxOverview,
+    #[serde(default)]
+    details: PuxDetails,
+    #[serde(default)]
+    trashed: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PuxOverview {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    urls: Vec<PuxUrl>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PuxUrl {
+    #[serde(default)]
+    url: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PuxDetails {
+    #[serde(default, rename = "loginFields")]
+    login_fields: Vec<PuxField>,
+    #[serde(default, rename = "notesPlain")]
+    notes_plain: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    sections: Vec<PuxSection>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PuxSection {
+    #[serde(default)]
+    fields: Vec<PuxField>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PuxField {
+    #[serde(default)]
+    designation: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    value: String,
+}
+
+/// 1PUX: a zip containing `export.data`.
+///
+/// Category UUIDs are trusted only where their meaning is unambiguous (`001` login, `002` password,
+/// `003` secure note). Everything else is inferred from the shape of the item, and refused with a
+/// reason when that fails — guessing that a credit card is a login is how people silently lose data.
+pub fn parse_1pux(bytes: &[u8]) -> ImportReport {
+    use std::io::Read;
+
+    let mut report = ImportReport::default();
+
+    let mut archive = match zip::ZipArchive::new(std::io::Cursor::new(bytes)) {
+        Ok(a) => a,
+        Err(e) => {
+            report.refuse(format!("not a 1PUX archive: {e}"));
+            return report;
+        }
+    };
+
+    let mut data = String::new();
+    match archive.by_name("export.data") {
+        Ok(mut entry) => {
+            if let Err(e) = entry.read_to_string(&mut data) {
+                report.refuse(format!("export.data unreadable: {e}"));
+                return report;
+            }
+        }
+        Err(_) => {
+            report.refuse("1PUX archive has no export.data (is this a 1Password export?)");
+            return report;
+        }
+    }
+
+    let export: PuxExport = match serde_json::from_str(&data) {
+        Ok(e) => e,
+        Err(e) => {
+            report.refuse(format!("export.data is not valid 1PUX JSON: {e}"));
+            return report;
+        }
+    };
+
+    let mut row = 0usize;
+    for account in export.accounts {
+        for vault in account.vaults {
+            for item in vault.items {
+                row += 1;
+                report.total += 1;
+
+                if item.trashed {
+                    report.push_skip(row, "in the trash");
+                    continue;
+                }
+
+                let title = item.overview.title.trim().to_string();
+                if title.is_empty() {
+                    report.push_skip(row, "no title");
+                    continue;
+                }
+
+                let url = if !item.overview.url.is_empty() {
+                    Some(item.overview.url.clone())
+                } else {
+                    item.overview.urls.iter().map(|u| u.url.clone()).find(|u| !u.is_empty())
+                };
+
+                let find_field = |wanted: &str| -> Option<String> {
+                    item.details
+                        .login_fields
+                        .iter()
+                        .find(|f| {
+                            f.designation.as_deref() == Some(wanted) || f.name.as_deref() == Some(wanted)
+                        })
+                        .map(|f| f.value.clone())
+                        .filter(|v| !v.is_empty())
+                };
+
+                let username = find_field("username");
+                let password_field = find_field("password")
+                    .or_else(|| item.details.password.clone())
+                    .filter(|v| !v.is_empty());
+                let totp = item
+                    .details
+                    .login_fields
+                    .iter()
+                    .find(|f| f.kind.as_deref() == Some("OTP"))
+                    .map(|f| f.value.clone())
+                    .or_else(|| {
+                        item.details
+                            .sections
+                            .iter()
+                            .flat_map(|s| s.fields.iter())
+                            .find(|f| f.kind.as_deref() == Some("OTP"))
+                            .map(|f| f.value.clone())
+                    })
+                    .filter(|v| !v.is_empty());
+
+                let category = match item.category_uuid.as_deref() {
+                    Some("001") => Some(Category::Login),
+                    Some("002") => Some(Category::Password),
+                    Some("003") => Some(Category::SecureNote),
+                    // A category we recognise as out of scope (cards, identities…) is never
+                    // re-interpreted from its fields: doing so would quietly turn a credit card into
+                    // a secure note, and the user would only find out when they needed the card.
+                    Some(_) => None,
+                    None => {
+                        if password_field.is_some() || username.is_some() || url.is_some() {
+                            Some(Category::Login)
+                        } else if item.details.notes_plain.as_deref().unwrap_or("").trim().is_empty() {
+                            None
+                        } else {
+                            Some(Category::SecureNote)
+                        }
+                    }
+                };
+
+                let Some(category) = category else {
+                    report.push_skip(
+                        row,
+                        format!(
+                            "unsupported 1PUX item (category {:?}) — not imported rather than guessed",
+                            item.category_uuid
+                        ),
+                    );
+                    continue;
+                };
+
+                let mut fields = Vec::new();
+                if let Some(u) = &username {
+                    fields.push(Field {
+                        name: "username".into(),
+                        kind: FieldKind::Text,
+                        value: u.clone(),
+                        conceal: false,
+                    });
+                }
+                if let Some(p) = &password_field {
+                    fields.push(Field {
+                        name: "password".into(),
+                        kind: FieldKind::Password,
+                        value: p.clone(),
+                        conceal: true,
+                    });
+                }
+                if let Some(t) = &totp {
+                    fields.push(Field {
+                        name: "totp".into(),
+                        kind: FieldKind::Totp,
+                        value: t.clone(),
+                        conceal: true,
+                    });
+                }
+                if let Some(u) = &url {
+                    fields.push(Field {
+                        name: "url".into(),
+                        kind: FieldKind::Url,
+                        value: u.clone(),
+                        conceal: false,
+                    });
+                }
+
+                let tags: Vec<String> =
+                    item.overview.tags.iter().filter(|t| !t.trim().is_empty()).cloned().collect();
+
+                report.imported.push(NewItem {
+                    category,
+                    overview: Overview {
+                        title,
+                        subtitle: username.clone().unwrap_or_default(),
+                        url_host: url.as_deref().map(host_of).unwrap_or_default(),
+                        tags,
+                        favorite: false,
+                    },
+                    detail: Detail {
+                        fields,
+                        notes: item.details.notes_plain.clone().unwrap_or_default(),
+                    },
+                });
+            }
+        }
+    }
+
+    if report.total == 0 {
+        report.refuse("export contained no items");
+    }
+    report
+}
+
 fn host_of(url: &str) -> String {
     url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("").to_string()
 }
@@ -419,5 +708,88 @@ Gitea,https://gitea.local,deploy,pw,,\n";
         assert_eq!(Format::detect("export.json", "name,url\n"), Format::Bitwarden);
         assert_eq!(Format::detect("mystery", "  {\"items\":[]}"), Format::Bitwarden);
         assert_eq!(Format::detect("mystery", "name,url\n"), Format::Csv);
+    }
+
+    // ---------------------------------------------------------------- 1PUX
+
+    fn make_1pux(export: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            w.start_file("export.data", opts).unwrap();
+            w.write_all(export.as_bytes()).unwrap();
+            w.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    #[test]
+    fn one_pux_imports_logins_and_explains_the_rest() {
+        let json = r#"{"accounts":[{"vaults":[{"items":[
+          {"categoryUuid":"001","overview":{"title":"GitHub","urls":[{"url":"https://github.com"}],"tags":["work"]},
+           "details":{"loginFields":[
+              {"designation":"username","name":"username","value":"hella"},
+              {"designation":"password","name":"password","value":"hunter2"},
+              {"designation":"","name":"one-time password","type":"OTP","value":"JBSWY3DPEHPK3PXP"}],
+             "notesPlain":"2fa on"}},
+          {"categoryUuid":"004","overview":{"title":"Visa"},"details":{"notesPlain":"card"}},
+          {"categoryUuid":"003","overview":{"title":"Codes"},"details":{"notesPlain":"x"},"trashed":true}
+        ]}]}]}"#;
+
+        let report = parse_1pux(&make_1pux(json));
+        assert_eq!(report.total, 3);
+        assert_eq!(report.imported.len(), 1, "skipped: {:?}", report.skipped);
+        assert_eq!(report.skipped.len(), 2);
+        assert!(report.accounted());
+
+        let gh = &report.imported[0];
+        assert_eq!(gh.overview.title, "GitHub");
+        assert_eq!(gh.overview.url_host, "github.com");
+        assert_eq!(gh.overview.tags, vec!["work".to_string()]);
+        assert!(gh.detail.fields.iter().any(|f| f.name == "totp" && f.conceal));
+        assert_eq!(gh.detail.notes, "2fa on");
+
+        assert!(report.skipped.iter().any(|s| s.reason.contains("unsupported 1PUX")));
+        assert!(report.skipped.iter().any(|s| s.reason.contains("trash")));
+    }
+
+    #[test]
+    fn one_pux_that_is_not_a_zip_is_refused() {
+        let report = parse_1pux(b"definitely not a zip");
+        assert!(report.accounted());
+        assert!(report.file_error.as_deref().unwrap_or_default().contains("not a 1PUX archive"));
+    }
+
+    #[test]
+    fn one_pux_without_export_data_is_refused() {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut buf);
+            w.start_file("other.txt", zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(b"hi").unwrap();
+            w.finish().unwrap();
+        }
+        let report = parse_1pux(&buf.into_inner());
+        assert!(report.accounted());
+        assert!(report.file_error.as_deref().unwrap_or_default().contains("no export.data"));
+    }
+
+    #[test]
+    fn zip_magic_beats_a_misleading_extension() {
+        let dir = std::env::temp_dir().join(format!("grim-1pux-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("misnamed.csv");
+        std::fs::write(&path, make_1pux(r#"{"accounts":[]}"#)).unwrap();
+        let report = parse_path(&path).unwrap();
+        assert!(
+            report.file_error.as_deref().unwrap_or_default().contains("no items"),
+            "zip magic should win over the extension, got {:?}",
+            report.file_error
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

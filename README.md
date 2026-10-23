@@ -37,7 +37,7 @@ no keys, no SQL). No sync yet. Phases P0–P5 in `DESIGN.md` §10.
 ## Build and run
 
 ```bash
-cargo test                                  # 32 tests: crypto, store, import, daemon, TUI
+cargo test                                  # 36 tests: crypto, store, import, daemon, TUI
 cargo build --release
 
 export GRIM_PASSPHRASE='…'                  # or omit to be prompted
@@ -99,8 +99,9 @@ honest state rendering; that applies to failures too.
 
 `grim import <file> [--dry-run]` reads a CSV (any of the common column spellings: `name`/`title`,
 `url`/`website`/`login_uri`, `username`/`login_username`, `password`/`login_password`, `totp`,
-`notes`, `folder`, `type`) or a Bitwarden JSON export. The format is guessed from the extension and
-then from the first byte.
+`notes`, `folder`, `type`), a Bitwarden JSON export, or a **1Password `.1pux` archive**. The format
+is detected from the zip magic first, then the extension, then the first byte — a mis-named file is
+still read correctly.
 
 The rule it enforces is the one that makes an import trustworthy: **every row is either imported or
 explained with a line number and a reason**, and a file that isn't recognisable is refused outright
@@ -127,8 +128,10 @@ grim: daemon: import refused: no name/title column recognised in the header
 1
 ```
 
-1PUX (the 1Password zip export) is **not** supported yet — it needs a zip reader and a second
-schema, and it is the obvious next thing for anyone migrating off 1Password.
+1PUX specifics: the archive is a zip containing `export.data`; logins, passwords and secure notes are
+imported with their TOTP secret, and items whose category can't be established confidently — credit
+cards, identities — are **skipped with a reason rather than guessed**. Trashed items are skipped and
+said to be trashed. An archive without `export.data`, or with no items at all, is refused.
 
 What P0a–P1 actually do: Argon2id + account-key derivation (§4.1), canary unlock, XChaCha20-Poly1305
 with per-slot AAD, overview/detail split with per-item keys (§5), RFC 6238 TOTP, owner-only file
