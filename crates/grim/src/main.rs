@@ -45,6 +45,13 @@ enum Cmd {
         #[arg(long)]
         snapshot: bool,
     },
+    /// Import a CSV or Bitwarden JSON export (every row is imported or explained)
+    Import {
+        path: PathBuf,
+        /// Parse and report, but write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Daemon state: locked or not, item count, vault path
     Status,
     /// Unlock the daemon (passphrase from GRIM_PASSPHRASE or prompt)
@@ -183,6 +190,43 @@ fn run(cli: &Cli) -> Result<()> {
         return Ok(());
     }
 
+    // Import: parse and report locally, then hand the daemon one atomic batch.
+    if let Cmd::Import { path, dry_run } = &cli.cmd {
+        let content = std::fs::read_to_string(path)?;
+        let report = grim_core::import::parse(&path.to_string_lossy(), &content);
+        print_report(&report, *dry_run);
+
+        // A refused file never reaches the vault.
+        if let Some(why) = &report.file_error {
+            return Err(Error::Daemon(format!("import refused: {why}")));
+        }
+
+        // The invariant is enforced, not assumed: total == imported + skipped.
+        if !report.accounted() {
+            return Err(Error::Daemon(format!(
+                "import aborted: {} row(s) read, {} importable, {} explained — {} unaccounted for",
+                report.total,
+                report.imported.len(),
+                report.skipped.len(),
+                report.total - report.imported.len() - report.skipped.len()
+            )));
+        }
+        if *dry_run || report.imported.is_empty() {
+            return Ok(());
+        }
+
+        let sock = socket_path(cli);
+        let items = report.imported.clone();
+        let n = items.len();
+        return match ok_or_daemon_error(call(&sock, &Request::ImportBatch { items })?)? {
+            Response::Imported { count } => {
+                println!("\nimported {count} of {n} item(s)");
+                Ok(())
+            }
+            other => Err(Error::Daemon(format!("unexpected reply: {other:?}"))),
+        };
+    }
+
     let sock = socket_path(cli);
     if let Cmd::Tui { snapshot } = cli.cmd {
         return if snapshot {
@@ -193,7 +237,7 @@ fn run(cli: &Cli) -> Result<()> {
         };
     }
     let req = match &cli.cmd {
-        Cmd::Init | Cmd::Tui { .. } => unreachable!("handled above"),
+        Cmd::Init | Cmd::Tui { .. } | Cmd::Import { .. } => unreachable!("handled above"),
         Cmd::Status => Request::Status,
         Cmd::Unlock => Request::Unlock { passphrase: passphrase(false)? },
         Cmd::Lock => Request::Lock,
@@ -303,6 +347,7 @@ fn render(cli: &Cli, resp: Response, reveal: bool) -> Result<()> {
         Response::Value { value } => println!("{value}"),
         Response::Totp { code, remaining } => println!("{code}  ({remaining}s left)"),
         Response::Added { id } => println!("{}", short(&id)),
+        Response::Imported { count } => println!("imported {count} item(s)"),
         Response::Error { message } => return Err(Error::Daemon(message)),
     }
     Ok(())
@@ -317,6 +362,34 @@ fn requested_field(cli: &Cli) -> Option<String> {
 
 fn short(id: &str) -> &str {
     &id[..id.len().min(8)]
+}
+
+/// Human report: counts, per-category breakdown, every skipped row with its reason.
+fn print_report(report: &grim_core::import::ImportReport, dry_run: bool) {
+    let prefix = if dry_run { "[dry run] " } else { "" };
+    println!(
+        "{prefix}{} row(s): {} importable, {} skipped",
+        report.total,
+        report.imported.len(),
+        report.skipped.len()
+    );
+
+    if !report.imported.is_empty() {
+        use std::collections::BTreeMap;
+        let mut by: BTreeMap<&str, usize> = BTreeMap::new();
+        for item in &report.imported {
+            *by.entry(item.category.as_str()).or_insert(0) += 1;
+        }
+        let summary: Vec<String> = by.iter().map(|(k, v)| format!("{k} {v}")).collect();
+        println!("  by category: {}", summary.join(", "));
+    }
+
+    for skip in &report.skipped {
+        println!("  skipped row {:<5} {}", skip.row, skip.reason);
+    }
+    if let Some(why) = &report.file_error {
+        println!("  refused: {why}");
+    }
 }
 
 fn host_of(url: &str) -> String {

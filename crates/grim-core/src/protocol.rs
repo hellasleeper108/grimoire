@@ -30,6 +30,10 @@ pub enum Request {
         overview: Overview,
         detail: Detail,
     },
+    /// Write a parsed import batch in one transaction (see `import::NewItem`).
+    ImportBatch {
+        items: Vec<crate::import::NewItem>,
+    },
     Quit,
 }
 
@@ -71,6 +75,9 @@ pub enum Response {
     },
     Added {
         id: String,
+    },
+    Imported {
+        count: usize,
     },
 }
 

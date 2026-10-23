@@ -199,6 +199,35 @@ impl Vault {
         Ok(id)
     }
 
+    /// Insert a whole batch in one transaction: the batch lands or nothing does.
+    ///
+    /// This is what makes an import honest — a failure halfway through leaves the vault exactly as
+    /// it was, so the caller can report "0 imported" instead of a half-populated vault.
+    pub fn insert_batch(&mut self, items: &[crate::import::NewItem]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        for item in items {
+            let id = uuid::Uuid::new_v4().to_string();
+            let ik = random_32();
+            let wrapped_ik = seal(&self.keys.enc, &ik, &aad_item(&id, "ik"))?;
+            let overview_enc = seal(&ik, &serde_json::to_vec(&item.overview)?, &aad_item(&id, "ov"))?;
+            let detail_enc = seal(&ik, &serde_json::to_vec(&item.detail)?, &aad_item(&id, "dt"))?;
+            let ts = now_secs();
+
+            tx.execute(
+                "INSERT INTO items(id, vault_id, category, version, overview_enc, detail_enc,
+                                   created_at, updated_at, favorite)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?6, 0)",
+                params![id, self.vault_id, item.category.as_str(), overview_enc, detail_enc, ts],
+            )?;
+            tx.execute(
+                "INSERT INTO item_keys(item_id, wrapped_ik) VALUES (?1, ?2)",
+                params![id, wrapped_ik],
+            )?;
+        }
+        tx.commit()?;
+        Ok(items.len())
+    }
+
     /// Cheap listing: decrypts overviews only. This is the whole point of the split.
     pub fn list(&self) -> Result<Vec<(String, Category, Overview)>> {
         let mut stmt = self.conn.prepare(

@@ -125,6 +125,13 @@ impl State {
                     Err(e) => (Response::Error { message: e.to_string() }, false),
                 }
             }
+            Request::ImportBatch { items } => {
+                let v = self.vault.as_mut().expect("unlocked");
+                match v.insert_batch(&items) {
+                    Ok(count) => (Response::Imported { count }, false),
+                    Err(e) => (Response::Error { message: e.to_string() }, false),
+                }
+            }
             Request::Quit => (Response::Ok, true),
         }
     }

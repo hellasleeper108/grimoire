@@ -30,14 +30,14 @@ Read in this order:
 3. `DESIGN.md` §6 — the actual TUI: layout, keys, states.
 4. `EVIDENCE-1PASSWORD.md` — the receipts, including where the tooling came up short.
 
-**Status:** design + **P0c implemented**. `grim-core` (crypto + store), `grimd` (daemon that owns
-keys and answers a closed verb set over a Unix socket), `grim` (CLI + ratatui TUI, no keys, no SQL).
-No sync yet. Phases P0–P5 in `DESIGN.md` §10.
+**Status:** design + **P0c + P1 (import)**. `grim-core` (crypto, store, import parsers), `grimd`
+(daemon that owns keys and answers a closed verb set over a Unix socket), `grim` (CLI + ratatui TUI,
+no keys, no SQL). No sync yet. Phases P0–P5 in `DESIGN.md` §10.
 
 ## Build and run
 
 ```bash
-cargo test                                  # 21 tests: crypto, store, daemon, TUI render
+cargo test                                  # 32 tests: crypto, store, import, daemon, TUI
 cargo build --release
 
 export GRIM_PASSPHRASE='…'                  # or omit to be prompted
@@ -95,7 +95,42 @@ Clipboard support is best-effort and named: `y` reports *which* tool accepted th
 plainly that no helper was found rather than pretending the copy worked. `DESIGN.md` §6.3 called for
 honest state rendering; that applies to failures too.
 
-What P0a–P0c actually do: Argon2id + account-key derivation (§4.1), canary unlock, XChaCha20-Poly1305
+## Import
+
+`grim import <file> [--dry-run]` reads a CSV (any of the common column spellings: `name`/`title`,
+`url`/`website`/`login_uri`, `username`/`login_username`, `password`/`login_password`, `totp`,
+`notes`, `folder`, `type`) or a Bitwarden JSON export. The format is guessed from the extension and
+then from the first byte.
+
+The rule it enforces is the one that makes an import trustworthy: **every row is either imported or
+explained with a line number and a reason**, and a file that isn't recognisable is refused outright
+rather than half-read. The whole batch then lands in one transaction — if the write fails, nothing is
+imported, so a retry can't double-populate.
+
+```
+$ grim import messy.csv
+4 row(s): 3 importable, 1 skipped
+  by category: login 2, securenote 1
+  skipped row 3     no title
+
+imported 3 of 3 item(s)
+
+$ grim import bitwarden.json
+2 row(s): 1 importable, 1 skipped
+  by category: login 1
+  skipped row 2     unsupported Bitwarden type 3 (card/identity)
+
+$ grim import not-an-export.csv ; echo $?
+0 row(s): 0 importable, 0 skipped
+  refused: no name/title column recognised in the header
+grim: daemon: import refused: no name/title column recognised in the header
+1
+```
+
+1PUX (the 1Password zip export) is **not** supported yet — it needs a zip reader and a second
+schema, and it is the obvious next thing for anyone migrating off 1Password.
+
+What P0a–P1 actually do: Argon2id + account-key derivation (§4.1), canary unlock, XChaCha20-Poly1305
 with per-slot AAD, overview/detail split with per-item keys (§5), RFC 6238 TOTP, owner-only file
 permissions, and a daemon/socket split where the client cannot touch the store (§2, §3.2).
 

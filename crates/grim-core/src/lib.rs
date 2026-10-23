@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
+pub mod import;
 pub mod protocol;
 pub mod store;
+pub use import::{ImportReport, NewItem, Skipped};
 pub use store::{Vault, VaultParams};
 
 // ---------------------------------------------------------------- errors
